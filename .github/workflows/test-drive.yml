@@ -1,0 +1,29 @@
+name: Test Google Drive upload
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rclone
+        run: |
+          if ! command -v rclone >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y rclone
+          fi
+      - name: Upload, read back and remove one private generated test file
+        env:
+          RCLONE_CONFIG_TEXT: ${{ secrets.RCLONE_CONFIG }}
+          GDRIVE_REMOTE: ${{ vars.GDRIVE_REMOTE || 'drive:YouTubeRecordings' }}
+        run: python3 test_drive_connection.py
+      - name: Save small sanitized test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: drive-connection-result
+          path: drive-test-result.json
+          retention-days: 2
