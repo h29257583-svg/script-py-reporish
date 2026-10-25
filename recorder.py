@@ -165,7 +165,7 @@ BOTCHECK_MARKERS = ["sign in to confirm you're not a bot", "confirm you're not a
 NO_FORMAT_MARKERS = ["no video formats found", "requested format is not available"]
 RATE_LIMIT_MARKERS = ["http error 403", "http error 429", "try again later", "too many requests"]
 NOT_LIVE_MARKERS = ["the channel is not currently live", "this live event will begin", "this live event has ended"]
-UNAVAILABLE_MARKERS = ["private video", "removed by the uploader", "video has been removed"]
+UNAVAILABLE_MARKERS = ["private video", "removed by the uploader", "video has been removed", "sign in to confirm your age"]
 NORMAL_END_MARKERS = ["finished downloading", "download complete", "has already been downloaded"]
 
 

@@ -41,6 +41,18 @@ class DeniedVideoRegression(unittest.TestCase):
         self.assertEqual(ns['classify_output']({'unavailable':True,'no_formats':True}), 'unavailable')
         self.assertEqual(ns['classify_output']({'rate_limited':True,'no_formats':True}), 'rate_limited')
 
+    def test_real_denial_messages_are_classified_before_retry(self):
+        tree = ast.parse(Path('recorder.py').read_text())
+        markers = {}
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and len(node.targets)==1 and isinstance(node.targets[0],ast.Name) and node.targets[0].id.endswith('_MARKERS'):
+                markers[node.targets[0].id] = ast.literal_eval(node.value)
+        ns = load('output_reader','classify_output', normalize_message=lambda text:text.casefold(), log_raw=lambda *_:None, **markers)
+        for message in ('Private video.', 'This video has been removed by the uploader.', 'Sign in to confirm your age.'):
+            flags = dict.fromkeys(('botcheck','rate_limited','no_formats','not_live','normal_exit','unavailable'),False)
+            ns['output_reader'](io.StringIO('ERROR: [youtube] fixture: '+message+'\n'), flags)
+            self.assertEqual(ns['classify_output'](flags),'unavailable')
+
     def test_private_video_is_not_short_exit_and_partial_media_is_kept(self):
         for has_media in (False, True):
             with tempfile.TemporaryDirectory() as d:
