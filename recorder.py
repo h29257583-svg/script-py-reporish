@@ -165,6 +165,7 @@ BOTCHECK_MARKERS = ["sign in to confirm you're not a bot", "confirm you're not a
 NO_FORMAT_MARKERS = ["no video formats found", "requested format is not available"]
 RATE_LIMIT_MARKERS = ["http error 403", "http error 429", "try again later", "too many requests"]
 NOT_LIVE_MARKERS = ["the channel is not currently live", "this live event will begin", "this live event has ended"]
+UNAVAILABLE_MARKERS = ["private video", "removed by the uploader", "video has been removed"]
 NORMAL_END_MARKERS = ["finished downloading", "download complete", "has already been downloaded"]
 
 
@@ -836,11 +837,12 @@ def output_reader(stream, output_state):
         output_state["rate_limited"] |= any(marker in lowered for marker in RATE_LIMIT_MARKERS)
         output_state["not_live"] |= any(marker in lowered for marker in NOT_LIVE_MARKERS)
         output_state["normal_exit"] |= any(marker in lowered for marker in NORMAL_END_MARKERS)
+        output_state["unavailable"] |= any(marker in lowered for marker in UNAVAILABLE_MARKERS)
 
 
 def classify_output(output_state):
-    for key in ("botcheck", "no_formats", "rate_limited", "not_live"):
-        if output_state[key]:
+    for key in ("botcheck", "rate_limited", "unavailable", "no_formats", "not_live"):
+        if output_state.get(key, False):
             return key
     return "normal_end" if output_state["normal_exit"] else "no_file"
 
@@ -892,6 +894,7 @@ def append_chunk(active, path, client, reason):
     active["recording_path"] = None
     active["last_failure_reason"] = None
     active["short_exit_streak"] = 0
+    active["access_failure_streak"] = 0
     active["recovery_needed"] = False
     active["cooldown_until"] = 0
     active["offline_since"] = None
@@ -949,7 +952,7 @@ def run_download_attempt(active, session_end, client, live_queue):
         CURRENT_PROC = process
     DOWNLOAD_ACTIVE.set()
 
-    output_state = {"botcheck": False, "no_formats": False, "rate_limited": False, "not_live": False, "normal_exit": False}
+    output_state = {"botcheck": False, "no_formats": False, "rate_limited": False, "not_live": False, "normal_exit": False, "unavailable": False}
     reader = threading.Thread(target=output_reader, args=(process.stdout, output_state), daemon=True)
     reader.start()
 
@@ -1013,7 +1016,10 @@ def run_download_attempt(active, session_end, client, live_queue):
     )
 
     # Preserve explicit authentication/rate-limit errors before short-exit handling.
-    if output_state["botcheck"] or output_state["rate_limited"]:
+    if output_state["botcheck"] or output_state["rate_limited"] or output_state["unavailable"]:
+        # Keep partial media even if a later request loses access.
+        if saved_path and saved_bytes >= MIN_SAVE_BYTES:
+            append_chunk(active, saved_path, client, "access_lost")
         active["recording_path"] = None
         reason = classify_output(output_state)
         save_active_state(active)
@@ -1059,6 +1065,15 @@ def run_download_attempt(active, session_end, client, live_queue):
     return False, reason, replacement_live
 
 
+def recovery_delay(reason, active):
+    if reason in {"botcheck", "rate_limited", "unavailable"}:
+        streak = int(active.get("access_failure_streak", 0)) + 1
+        active["access_failure_streak"] = streak
+        initial = 600 if reason == "unavailable" else 300
+        return min(3600, initial * (2 ** min(streak - 1, 4)))
+    return max(30, FAILURE_COOLDOWN_SECONDS)
+
+
 def record_until_stop(active, session_end, live_queue):
     if active.get("client_locked") and active.get("preferred_client") in DOWNLOAD_CLIENTS:
         preferred = active["preferred_client"]
@@ -1074,7 +1089,9 @@ def record_until_stop(active, session_end, live_queue):
             if replacement_live: return False, "new_live_id", replacement_live
             if STOP_REQUESTED: return False, "termination", None
             if time.time() >= session_end: return False, "session_end", None
-            if reason in {"not_live", "normal_end"}: return False, reason, None
+            if reason in {"not_live", "normal_end", "botcheck", "rate_limited", "unavailable"}:
+                # Switching clients repeats the same denied video request.
+                return False, reason, None
             last_reason = reason
 
             if reason == "short_exit":
@@ -1216,11 +1233,11 @@ try:
 
                 if reason in {
                     "not_live", "normal_end", "download_failed", "launch_error",
-                    "botcheck", "rate_limited", "no_formats", "no_file", "short_exit",
+                    "botcheck", "rate_limited", "unavailable", "no_formats", "no_file", "short_exit",
                 }:
                     active["recovery_needed"] = True
                     active["last_failure_reason"] = reason
-                    cooldown = 300 if reason in {"botcheck", "rate_limited"} else FAILURE_COOLDOWN_SECONDS
+                    cooldown = recovery_delay(reason, active)
                     active["cooldown_until"] = time.time() + cooldown
                     save_active_state(active)
                     log(f"recovery_cooldown | reason={reason} | waiting={cooldown}s")
