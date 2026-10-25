@@ -58,6 +58,7 @@ def main():
             report['stages']['video_drive_upload']={'status':'PASS' if uploaded==0 else 'FAIL'}
             upload=json.loads(Path('upload-report.json').read_text());report['session_url']=upload.get('session_url')
             report['files_uploaded']=upload.get('unique_uploaded_files')
+            report['stages']['session_folder']={'status':'PASS' if upload.get('session_url') else 'FAIL'}
             for summary in Path('streams').glob('*_summary.json'):
                 report['capture_summary']=json.loads(summary.read_text())
             if Path('streams/rolling-backup.json').exists():report['safety_backup']=json.loads(Path('streams/rolling-backup.json').read_text())

@@ -294,15 +294,25 @@ class Publisher:
     def resolve_session_url(self):
         if not self.drive_config:return
         safety_receipts=[c.get('receipt',{}) for c in self.rolling.get('clips',[]) if c.get('status')=='uploaded']
+        attempted=set()
         for record in self.results + [{'receipts':safety_receipts}]:
             for receipt in record.get('receipts',[]):
                 path=receipt.get('session_path')
-                if receipt.get('provider')!='google_drive' or not path:continue
+                if receipt.get('provider')!='google_drive' or not path or path in attempted:continue
+                attempted.add(path)
                 try:
                     result=subprocess.run(['rclone','--config',self.drive_config,'lsjson',path,'--stat'],
                                           capture_output=True,text=True,timeout=min(20,self.remaining()))
                     data=json.loads(result.stdout);folder=data.get('ID','')
-                    if result.returncode==0 and data.get('IsDir') and re.fullmatch(r'[A-Za-z0-9_-]+',folder):
+                    # Older rclone synthesizes --stat directory entries without IDs.
+                    if not folder:
+                        parent,name=path.rsplit('/',1)
+                        listing=subprocess.run(['rclone','--config',self.drive_config,'lsjson',parent,'--dirs-only','--max-depth','1'],
+                                               capture_output=True,text=True,timeout=min(20,self.remaining()))
+                        entries=json.loads(listing.stdout)
+                        data=next((entry for entry in entries if entry.get('Name')==name and entry.get('IsDir')), {}) if listing.returncode==0 else {}
+                        folder=data.get('ID','')
+                    if data.get('IsDir') and re.fullmatch(r'[A-Za-z0-9_-]+',folder):
                         self.session_url='https://drive.google.com/drive/folders/'+folder
                         return
                 except (OSError,ValueError,PublishError,subprocess.TimeoutExpired):pass

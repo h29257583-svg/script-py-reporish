@@ -70,4 +70,50 @@ class MediaTests(unittest.TestCase):
    fake=subprocess.CompletedProcess([],0,json.dumps({'Size':4,'Hashes':{'md5':'wrong'}}),'')
    with patch('publish_recordings.subprocess.run',return_value=fake):self.assertIsNone(pub.verified_prior(metadata))
 
+
+class RestartAndTransportTests(unittest.TestCase):
+ def test_safety_manifest_resume_keeps_uploaded_and_pending_clips(self):
+  with tempfile.TemporaryDirectory() as d:
+   root=Path(d);source=root/'_chunks'/'x_chunk0001.ts';source.parent.mkdir();MediaTests.generate(source,14)
+   first=SafetyArchive(root,seconds=5,overlap=1,uploader=Mock());first.stage(final=True)
+   first.clips[0]['status']='uploaded';(first.work/first.clips[0]['local']).unlink();first.save()
+   second=SafetyArchive(root,seconds=5,overlap=1,uploader=Mock());second.stage(final=True)
+   self.assertEqual(len(second.clips),len(first.clips));self.assertEqual(second.clips[0]['status'],'uploaded')
+ def test_http_denial_is_not_retried(self):
+  from hls_capture import configure_session
+  import requests
+  for status in (403,429):
+   response=requests.Response();response.status_code=status;error=RuntimeError('withheld');error.err=requests.HTTPError(response=response)
+   session=Mock();session.http.request=Mock(side_effect=error);original=session.http.request
+   state=configure_session(session,{},None)
+   with self.assertRaises(RuntimeError):session.http.request('GET','https://example.invalid/fixture')
+   self.assertEqual(original.call_count,1);self.assertIsNotNone(state['denial'])
+ def test_retry_after_is_respected_without_early_retry(self):
+  from hls_capture import configure_session
+  import requests
+  response=requests.Response();response.status_code=503;response.headers['Retry-After']='120'
+  error=RuntimeError('withheld');error.err=requests.HTTPError(response=response)
+  session=Mock();session.http.request=Mock(side_effect=error);original=session.http.request
+  configure_session(session,{},None)
+  with self.assertRaises(RuntimeError):session.http.request('GET','https://example.invalid/fixture')
+  self.assertEqual(original.call_count,1)
+ def test_tls_verification_failure_is_not_retried(self):
+  from hls_capture import configure_session
+  import requests
+  error=RuntimeError('withheld');error.err=requests.exceptions.SSLError('invalid certificate')
+  session=Mock();session.http.request=Mock(side_effect=error);original=session.http.request
+  configure_session(session,{},None)
+  with self.assertRaises(RuntimeError):session.http.request('GET','https://example.invalid/fixture')
+  self.assertEqual(original.call_count,1)
+
+class FolderLinkTests(unittest.TestCase):
+ def test_directory_id_is_resolved_from_parent_when_stat_omits_it(self):
+  with tempfile.TemporaryDirectory() as d:
+   pub=Publisher(Path(d),Path(d)/'report.json',1800);pub.drive_config='/private/config'
+   pub.results=[{'receipts':[{'provider':'google_drive','session_path':'drive:YouTubeRecordings/repo/session1'}]}]
+   outputs=[subprocess.CompletedProcess([],0,json.dumps({'IsDir':True,'Name':'session1'}),''),
+            subprocess.CompletedProcess([],0,json.dumps([{'IsDir':True,'Name':'session1','ID':'folder123'}]),'')]
+   with patch('publish_recordings.subprocess.run',side_effect=outputs):pub.resolve_session_url()
+   self.assertEqual(pub.session_url,'https://drive.google.com/drive/folders/folder123')
+
 if __name__=='__main__':unittest.main()

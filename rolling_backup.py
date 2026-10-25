@@ -61,6 +61,15 @@ class SafetyArchive:
         self.seconds,self.overlap,self.max_pending=seconds,overlap,max_pending_bytes
         self.config=config;self.stop=threading.Event();self.lock=threading.Lock()
         self.sources={};self.clips=[];self.last_error=None;self.upload=uploader or self.drive_upload
+        try:
+            previous=json.loads(self.report.read_text())
+            for clip in previous.get('clips',[]):
+                name=clip.get('local','')
+                if not name or Path(name).name!=name:continue
+                if clip.get('status')=='uploaded' or (self.work/name).is_file():
+                    if clip.get('status')!='uploaded':clip.update(status='pending',retry_at=0)
+                    self.clips.append(clip)
+        except (OSError,ValueError,TypeError,AttributeError):pass
         self.capture_finished=False
         self.state='not_configured' if not config and uploader is None else 'running'
 
@@ -83,7 +92,11 @@ class SafetyArchive:
             if '_chunks' not in path.parts and key not in self.sources:continue
             if key not in self.sources:
                 relative=str(path.relative_to(self.root))
-                self.sources[key]={'path':path,'name':relative,'cursor':0.0,
+                covered=0.0
+                for clip in sorted((c for c in self.clips if c.get('source')==relative),key=lambda c:c['start_seconds']):
+                    if clip['start_seconds']>covered+.01:break
+                    covered=max(covered,clip['start_seconds']+clip['requested_duration'])
+                self.sources[key]={'path':path,'name':relative,'cursor':max(0,covered-self.overlap),
                                    'id':hashlib.sha256(relative.encode()).hexdigest()[:16]}
             self.sources[key]['path']=path
 
