@@ -10,8 +10,8 @@ WINDOW = 3 * 3600
 
 
 def plan(start, total_hours, now, index=0):
-    if not 0 < total_hours <= 9 or not 0 <= index <= 3:
-        raise ValueError('total_hours must be greater than 0 and at most 9; shift_index must be 0..3')
+    if not 0 < total_hours <= 14 or not 0 <= index <= 6:
+        raise ValueError('total_hours must be greater than 0 and at most 14; shift_index must be 0..6')
     if start > now + 60:
         raise ValueError('session_start cannot be in the future')
     deadline = start + round(total_hours * 3600)
@@ -22,7 +22,7 @@ def plan(start, total_hours, now, index=0):
     return {'active': remaining > 0, 'duration_hours': min(WINDOW, remaining) / 3600,
             'deadline': deadline, 'window_deadline': window_deadline,
             'next_at': next_at, 'next_index': next_index,
-            'chain': remaining > 0 and next_at < deadline and window_deadline < deadline and next_index <= 3}
+            'chain': remaining > 0 and next_at < deadline and window_deadline < deadline and next_index <= 6}
 
 
 def main():

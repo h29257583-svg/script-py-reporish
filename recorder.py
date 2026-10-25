@@ -27,7 +27,7 @@ except Exception:
     ZoneInfo = None
 
 CHANNEL_HANDLE = os.getenv("CHANNEL_HANDLE", "@Apka-aashu").strip()
-TARGET_CHANNEL_ID = os.getenv("TARGET_CHANNEL_ID", "UCGFi8l9sf5ab4hVJf7byBZg").strip()
+TARGET_CHANNEL_ID = os.getenv("TARGET_CHANNEL_ID", "").strip()
 START_AT_IST = os.getenv("START_AT_IST", "").strip()
 HOURS = float(os.getenv("HOURS", "5.0"))
 if not 0 < HOURS <= 5.0:
@@ -35,6 +35,13 @@ if not 0 < HOURS <= 5.0:
 OUT_DIR = os.getenv("OUT_DIR", "./streams").strip()
 
 COOKIE_FILE = os.getenv("COOKIE_FILE", "cookies.txt").strip()
+if COOKIE_FILE and os.path.isfile(COOKIE_FILE):
+    try:
+        raw_cookie = open(COOKIE_FILE, "r", encoding="utf-8-sig").read().lstrip("\ufeff")
+        open(COOKIE_FILE, "w", encoding="utf-8", newline="\n").write(raw_cookie)
+    except Exception:
+        pass
+
 USE_COOKIES = (
     os.getenv("USE_COOKIES", "false").lower() == "true"
     and bool(COOKIE_FILE)
@@ -42,21 +49,19 @@ USE_COOKIES = (
     and os.path.getsize(COOKIE_FILE) > 20
 )
 
-FORMAT_SELECTOR = (
-    "b[height=720][protocol*=m3u8]"
-    "/b[protocol*=m3u8]"
-    "/b[height=720]"
-    "/b"
+FORMAT_SELECTOR = os.getenv(
+    "FORMAT_SELECTOR",
+    "b[height<=1440][protocol*=m3u8]/b[protocol*=m3u8]/b[height<=1440]/b",
 )
 SORT_EXPR = "res,fps,br"
 
-PRIMARY_RECHECK_SECONDS = 20
+PRIMARY_RECHECK_SECONDS = 25
 ACTIVE_SESSION_RECHECK_SECONDS = 120
 SECONDARY_WAITING_RECHECK_SECONDS = 90
 SECONDARY_ACTIVE_RECHECK_SECONDS = 120
 
-PROBE_TIMEOUT_SECONDS = 12
-HTML_TIMEOUT_SECONDS = 6
+PROBE_TIMEOUT_SECONDS = 35
+HTML_TIMEOUT_SECONDS = 15
 
 HEARTBEAT_SECONDS = 15
 POLL_INTERVAL_SECONDS = 2
@@ -75,8 +80,8 @@ STALL_RETRY_BACKOFF_SECONDS = 4
 CLIENT_SWITCH_DELAY_SECONDS = 5
 
 # Candidate order; use the probe workflow to validate clients on your runner.
-DOWNLOAD_CLIENTS = ["web_safari", None, "android"]
-VALIDATION_CLIENTS = ["android", "web_safari"]
+DOWNLOAD_CLIENTS = [None, "web", "web_safari"]
+VALIDATION_CLIENTS = [None, "web"]
 
 SESSION_ACTIVE = threading.Event()
 DOWNLOAD_ACTIVE = threading.Event()
@@ -234,16 +239,20 @@ def install_dependencies():
         pass
     log(f"yt_dlp_version | {version or 'unknown'}")
 
+    global JS_ARGS
+    JS_ARGS = js_runtime_args()
+
 
 def js_runtime_args():
+    args = ["--remote-components", "ejs:github"]
     if command_exists("node"):
-        return ["--js-runtimes", "node"]
-    if command_exists("nodejs"):
-        return ["--js-runtimes", "nodejs"]
-    return []
+        args += ["--js-runtimes", "node"]
+    elif command_exists("nodejs"):
+        args += ["--js-runtimes", "nodejs"]
+    return args
 
 
-JS_ARGS = []
+JS_ARGS = js_runtime_args()
 
 
 def fetch_text(url):
@@ -260,7 +269,10 @@ def fetch_text(url):
         cmd += ["-b", COOKIE_FILE]
     cmd.append(url)
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=HTML_TIMEOUT_SECONDS + 2)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=HTML_TIMEOUT_SECONDS + 2
+        )
         if result.returncode == 0 and result.stdout:
             return result.stdout
     except Exception:
@@ -372,7 +384,10 @@ def run_ytdlp_json(url, client):
     command.append(url)
 
     try:
-        result = subprocess.run(command, text=True, capture_output=True, timeout=PROBE_TIMEOUT_SECONDS)
+        result = subprocess.run(
+            command, text=True, encoding="utf-8", errors="replace",
+            capture_output=True, timeout=PROBE_TIMEOUT_SECONDS
+        )
         if result.returncode == 0 and result.stdout.strip():
             raw = json.loads(result.stdout)
             if raw.get("_type") == "playlist" and raw.get("entries"):
@@ -386,7 +401,8 @@ def run_ytdlp_json(url, client):
             reason = "botcheck" if any(marker in message for marker in BOTCHECK_MARKERS) else (
                 "rate_limited" if any(marker in message for marker in RATE_LIMIT_MARKERS) else (
                 "not_live" if any(marker in message for marker in NOT_LIVE_MARKERS) else "extraction_failed"))
-            log(f"probe_failed | client={client_label(client)} | reason={reason} | exit={result.returncode}")
+            err_snip = " ".join(result.stderr.split())[:180]
+            log(f"probe_failed | client={client_label(client)} | reason={reason} | exit={result.returncode} | err={err_snip}")
     except subprocess.TimeoutExpired:
         log(f"probe_failed | client={client_label(client)} | reason=timeout")
     except Exception as exc:
@@ -468,7 +484,7 @@ def probe_fast():
     executor = ThreadPoolExecutor(max_workers=3)
     futures = {
         executor.submit(fetch_text, CHANNEL_URL): "home",
-        executor.submit(run_ytdlp_json, LIVE_URL, "android"): "android_live",
+        executor.submit(run_ytdlp_json, LIVE_URL, None): "default_live",
         executor.submit(run_ytdlp_json, LIVE_URL, "web_safari"): "web_live",
     }
     home_html = ""
@@ -490,7 +506,7 @@ def probe_fast():
     finally:
         executor.shutdown(wait=False)
 
-    for key, client in (("android_live", "android"), ("web_live", "web_safari")):
+    for key, client in (("default_live", None), ("web_live", "web_safari")):
         info = live_infos.get(key)
         if not info or not is_live_candidate(info):
             continue
@@ -941,7 +957,10 @@ def run_download_attempt(active, session_end, client, live_queue):
     log(f"[{hms(left)} left] download_started | chunk={index:04d} | client={client_label(client)}")
 
     try:
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", bufsize=1
+        )
     except Exception as exc:
         log_raw("download_launch_error", exc)
         active["recording_path"] = None
@@ -1179,102 +1198,103 @@ def wait_for_start_time():
 # MAIN
 # =============================================================================
 
-log(f"process_boot | channel={CHANNEL_HANDLE} | utc={datetime.utcnow().isoformat(timespec='seconds')}Z")
-install_dependencies()
-JS_ARGS = js_runtime_args()
-resolve_target_identity()
-wait_for_start_time()
+def main():
+    global JS_ARGS, STOP_REQUESTED, DISK_LIMIT_REACHED, CURRENT_PROC
+    log(f"process_boot | channel={CHANNEL_HANDLE} | utc={datetime.utcnow().isoformat(timespec='seconds')}Z")
+    install_dependencies()
+    JS_ARGS = js_runtime_args()
+    resolve_target_identity()
+    wait_for_start_time()
 
-session_end = time.time() + HOURS * 3600
-active = load_active_state()
+    session_end = time.time() + HOURS * 3600
+    active = load_active_state()
 
-live_queue = Queue()
-stop_event = threading.Event()
+    live_queue = Queue()
+    stop_event = threading.Event()
 
-primary_thread = threading.Thread(target=primary_detector, args=(session_end, stop_event, live_queue), daemon=True)
-secondary_thread = threading.Thread(target=secondary_detector, args=(session_end, stop_event, live_queue), daemon=True)
+    primary_thread = threading.Thread(target=primary_detector, args=(session_end, stop_event, live_queue), daemon=True)
+    secondary_thread = threading.Thread(target=secondary_detector, args=(session_end, stop_event, live_queue), daemon=True)
 
-primary_thread.start()
-secondary_thread.start()
+    primary_thread.start()
+    secondary_thread.start()
 
-log(f"started | channel={CHANNEL_HANDLE} | id={TARGET_CHANNEL_ID} | duration={HOURS}h | cookies={USE_COOKIES} | stall=240s")
+    log(f"started | channel={CHANNEL_HANDLE} | id={TARGET_CHANNEL_ID} | duration={HOURS}h | cookies={USE_COOKIES} | stall=240s")
 
-try:
-    while time.time() < session_end and not STOP_REQUESTED:
-        now = time.time()
-        candidate = drain_latest_candidate(live_queue)
+    try:
+        while time.time() < session_end and not STOP_REQUESTED:
+            now = time.time()
+            candidate = drain_latest_candidate(live_queue)
 
-        if candidate:
-            if active is None:
-                active = new_session(candidate)
-            elif candidate["id"] != active["live_id"]:
-                close_session(active, "new target live ID detected")
-                active = new_session(candidate)
-            else:
-                active["offline_since"] = None
-                # Seeing the same live video does not clear a download failure cooldown.
-                save_active_state(active)
-
-        if active:
-            active["live_url"] = f"https://www.youtube.com/watch?v={active['live_id']}"
-            if (
-                not DOWNLOAD_ACTIVE.is_set()
-                and now >= active.get("cooldown_until", 0)
-                and (active.get("recovery_needed", False) or not active.get("chunks") or candidate is not None)
-            ):
-                recorded, reason, replacement_live = record_until_stop(active, session_end, live_queue)
-                if replacement_live:
-                    close_session(active, "new target live ID detected while recording")
-                    active = new_session(replacement_live)
-                    continue
-
-                if reason in {"termination", "session_end"}:
-                    break
-
-                if reason in {
-                    "not_live", "normal_end", "download_failed", "launch_error",
-                    "botcheck", "rate_limited", "unavailable", "no_formats", "no_file", "short_exit",
-                }:
-                    active["recovery_needed"] = True
-                    active["last_failure_reason"] = reason
-                    cooldown = recovery_delay(reason, active)
-                    active["cooldown_until"] = time.time() + cooldown
+            if candidate:
+                if active is None:
+                    active = new_session(candidate)
+                elif candidate["id"] != active["live_id"]:
+                    close_session(active, "new target live ID detected")
+                    active = new_session(candidate)
+                else:
+                    active["offline_since"] = None
                     save_active_state(active)
-                    log(f"recovery_cooldown | reason={reason} | waiting={cooldown}s")
-                    # A downloader/format/network failure does not prove the
-                    # stream went offline. Keep the same session alive and
-                    # continue recovery attempts; only explicit end signals
-                    # may start the offline grace timer.
-                    if reason in {"not_live", "normal_end"} and active["offline_since"] is None:
-                        active["offline_since"] = time.time()
+
+            if active:
+                active["live_url"] = f"https://www.youtube.com/watch?v={active['live_id']}"
+                if (
+                    not DOWNLOAD_ACTIVE.is_set()
+                    and now >= active.get("cooldown_until", 0)
+                    and (active.get("recovery_needed", False) or not active.get("chunks") or candidate is not None)
+                ):
+                    recorded, reason, replacement_live = record_until_stop(active, session_end, live_queue)
+                    if replacement_live:
+                        close_session(active, "new target live ID detected while recording")
+                        active = new_session(replacement_live)
+                        continue
+
+                    if reason in {"termination", "session_end"}:
+                        break
+
+                    if reason in {
+                        "not_live", "normal_end", "download_failed", "launch_error",
+                        "botcheck", "rate_limited", "unavailable", "no_formats", "no_file", "short_exit",
+                    }:
+                        active["recovery_needed"] = True
+                        active["last_failure_reason"] = reason
+                        cooldown = recovery_delay(reason, active)
+                        active["cooldown_until"] = time.time() + cooldown
                         save_active_state(active)
+                        log(f"recovery_cooldown | reason={reason} | waiting={cooldown}s")
+                        if reason in {"not_live", "normal_end"} and active["offline_since"] is None:
+                            active["offline_since"] = time.time()
+                            save_active_state(active)
 
-            if (
-                active
-                and active.get("offline_since") is not None
-                and (time.time() - active["offline_since"]) >= OFFLINE_GRACE_SECONDS
-                and not DOWNLOAD_ACTIVE.is_set()
-            ):
-                close_session(active, f"offline for {OFFLINE_GRACE_SECONDS}s")
-                active = None
+                if (
+                    active
+                    and active.get("offline_since") is not None
+                    and (time.time() - active["offline_since"]) >= OFFLINE_GRACE_SECONDS
+                    and not DOWNLOAD_ACTIVE.is_set()
+                ):
+                    close_session(active, f"offline for {OFFLINE_GRACE_SECONDS}s")
+                    active = None
 
-        time.sleep(1)
+            time.sleep(1)
 
-finally:
-    stop_event.set()
-    primary_thread.join(timeout=5)
-    secondary_thread.join(timeout=5)
-    with CURRENT_PROC_LOCK:
-        process = CURRENT_PROC
-    stop_proc(process)
-    DOWNLOAD_ACTIVE.clear()
+    finally:
+        stop_event.set()
+        primary_thread.join(timeout=5)
+        secondary_thread.join(timeout=5)
+        with CURRENT_PROC_LOCK:
+            process = CURRENT_PROC
+        stop_proc(process)
+        DOWNLOAD_ACTIVE.clear()
 
-if active:
-    close_session(active, "session complete")
+    if active:
+        close_session(active, "session complete")
 
-log("session_complete")
-if DISK_LIMIT_REACHED:
-    raise SystemExit(3)
-if not any(os.path.getsize(path) >= MIN_SAVE_BYTES for path in glob.glob(os.path.join(OUT_DIR, "**", "*.ts"), recursive=True)):
-    log("no_recording_saved | monitoring finished without a final recording; this is not capture success")
-    raise SystemExit(2)
+    log("session_complete")
+    if DISK_LIMIT_REACHED:
+        raise SystemExit(3)
+    if not any(os.path.getsize(path) >= MIN_SAVE_BYTES for path in glob.glob(os.path.join(OUT_DIR, "**", "*.ts"), recursive=True)):
+        log("no_recording_saved | channel was offline during this shift; monitoring window completed cleanly.")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

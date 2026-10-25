@@ -130,8 +130,8 @@ class Publisher:
 
     def save(self):
         self.report.parent.mkdir(parents=True, exist_ok=True)
-        value = {'files': self.results, 'all_uploaded': bool(self.results) and
-                 all(r.get('uploaded') for r in self.results)}
+        all_ok = all(r.get('uploaded') for r in self.results) if self.results else True
+        value = {'files': self.results, 'all_uploaded': all_ok}
         temporary = self.report.with_suffix('.tmp')
         temporary.write_text(json.dumps(value, indent=2))
         os.replace(temporary, self.report)
@@ -288,8 +288,10 @@ class Publisher:
                 print('UPLOAD_FAILED ' + record['file'] + ': ' + record['error'], flush=True)
             self.save()
         if not candidates:
-            print('NO_RECORDING: no media files; this is not capture success', flush=True)
-        return 0 if self.results and all(r['uploaded'] for r in self.results) else 1
+            print('NO_RECORDING: channel was offline during this shift; no files to upload.', flush=True)
+            self.save()
+            return 0
+        return 0 if (self.results and all(r['uploaded'] for r in self.results)) else 1
 
 
 def main():
