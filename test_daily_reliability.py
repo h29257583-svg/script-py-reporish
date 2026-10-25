@@ -116,4 +116,30 @@ class FolderLinkTests(unittest.TestCase):
    with patch('publish_recordings.subprocess.run',side_effect=outputs):pub.resolve_session_url()
    self.assertEqual(pub.session_url,'https://drive.google.com/drive/folders/folder123')
 
+
+
+class MetadataStateTests(unittest.TestCase):
+ def test_missing_live_fields_are_unknown_not_offline(self):
+  from probe_health import metadata_state
+  for value in ({'_type':'playlist','entries':[]},{'_type':'url','id':'fixture1234'},{'id':'fixture1234'}):
+   self.assertEqual(metadata_state(value),'unknown_metadata')
+  self.assertEqual(metadata_state({'id':'fixture1234','is_live':False}),'not_live_metadata')
+  self.assertEqual(metadata_state({'id':'fixture1234','live_status':'is_live'}),'live')
+
+
+class CachedSelectionTests(unittest.TestCase):
+ def test_cached_player_formats_are_selected_without_another_request(self):
+  import ast,re,tempfile
+  tree=ast.parse(Path('recorder.py').read_text())
+  node=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='stage_media_info')
+  selector=next(ast.literal_eval(n.value) for n in tree.body if isinstance(n,ast.Assign) and isinstance(n.targets[0],ast.Name) and n.targets[0].id=='FORMAT_SELECTOR')
+  formats=[{'format_id':'720hls','url':'https://example.invalid/720','protocol':'m3u8_native','ext':'ts','height':720,'width':1280,'acodec':'aac','vcodec':'h264'},
+           {'format_id':'1080hls','url':'https://example.invalid/1080','protocol':'m3u8_native','ext':'ts','height':1080,'width':1920,'acodec':'aac','vcodec':'h264'}]
+  with tempfile.TemporaryDirectory() as d:
+   ns={'FORMAT_SELECTOR':selector,'os':os,'re':re,'json':json,'tempfile':tempfile,'MEDIA_INFO_DIR':d,'client_label':lambda c:c or 'default'}
+   exec(compile(ast.Module(body=[node],type_ignores=[]),'<cached-selection>','exec'),ns)
+   file=ns['stage_media_info']({'id':'fixture1234','is_live':True,'formats':formats},'web_safari')
+   data=json.loads(Path(file).read_text());self.assertEqual(data['format_id'],'720hls')
+   self.assertEqual(Path(file).stat().st_mode & 0o777,0o600)
+
 if __name__=='__main__':unittest.main()

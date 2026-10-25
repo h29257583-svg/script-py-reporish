@@ -11,6 +11,12 @@ from unittest.mock import Mock
 
 
 def load(*names, **namespace):
+    from probe_health import classify_message, ProbeHealth
+    namespace.setdefault('SUMMARY',{})
+    namespace.setdefault('SUMMARY_LOCK',threading.RLock())
+    namespace.setdefault('write_summary',lambda **updates:namespace['SUMMARY'].update(updates))
+    namespace.setdefault('classify_message',classify_message)
+    namespace.setdefault('HEALTH',ProbeHealth())
     tree = ast.parse(Path('recorder.py').read_text())
     nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
     exec(compile(ast.Module(body=nodes, type_ignores=[]), '<recorder-functions>', 'exec'), namespace)

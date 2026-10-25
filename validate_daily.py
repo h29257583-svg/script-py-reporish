@@ -17,10 +17,19 @@ def main():
     def command(stage,args,env=None,timeout=180):
         result=subprocess.run(args,env=env,capture_output=True,text=True,timeout=timeout)
         report['stages'][stage]={'status':'PASS' if result.returncode==0 else 'FAIL','exit_code':result.returncode}
+        if stage=='live_capture':
+            from hls_capture import MESSAGES
+            events=[]
+            for line in result.stdout.splitlines():
+                for reason,message in MESSAGES.items():
+                    if 'ERROR: '+message in line:events.append(reason)
+            report['stages'][stage]['transport_error_codes']=events[-20:]
         save();return result.returncode==0
     try:
+        from check_telegram import main as telegram_readiness
+        report['optional_telegram']=telegram_readiness()
         if os.environ.get('RUN_UNIT_TESTS')=='true':
-            if not command('regression_tests',[sys.executable,'-m','unittest','test_reliability','test_retry_backoff','test_daily_reliability','-q'],timeout=180):return 1
+            if not command('regression_tests',[sys.executable,'-m','unittest','test_reliability','test_retry_backoff','test_daily_reliability','test_private_setup_helper','-q'],timeout=180):return 1
         if os.environ.get('RUN_FAULT_TEST')=='true':
             command('network_blink',[sys.executable,'test_network_blink.py'],timeout=150)
             path=Path('validation/network-blink-streamlink/result.json')

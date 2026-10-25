@@ -14,6 +14,8 @@ def classify_message(message):
         return 'botcheck'
     if 'confirm your age' in text:
         return 'age_verification'
+    if 'no video formats found' in text or 'requested format is not available' in text:
+        return 'no_formats'
     if 'private video' in text:
         return 'private_video'
     if 'removed by the uploader' in text or 'video has been removed' in text:
@@ -43,6 +45,14 @@ class ProbeHealth:
         self.last = None
         self.last_success = None
         self.last_reason = None
+        self.metadata_evidence = []
+
+    def observe_metadata(self, info):
+        # Public structural fields only; never URLs, headers, cookies, tokens or titles.
+        fields={key:info.get(key) for key in ('id','_type','is_live','live_status','channel_id','extractor_key')}
+        fields['formats_count']=len(info.get('formats') or [])
+        fields['download_url_ready']=bool(info.get('url') and 'm3u8' in str(info.get('protocol','')))
+        with self.lock:self.metadata_evidence=(self.metadata_evidence+[fields])[-4:]
 
     def observe(self, reason):
         with self.lock:
@@ -87,8 +97,18 @@ class ProbeHealth:
         with self.lock:
             return {'counts':dict(self.counts), 'last_probe_utc':self.last,
                     'last_successful_probe_utc':self.last_success, 'last_reason':self.last_reason,
-                    'probe_cooldown_seconds':round(max(0,self.blocked_until-self.clock())),
+                    'probe_cooldown_seconds':round(max(0,self.blocked_until-self.clock())), 'metadata_evidence':list(self.metadata_evidence),
                     'offline_is_not_inferred_from_network_or_auth_errors':True}
+
+
+def metadata_state(info):
+    if not isinstance(info,dict) or info.get('_type') in ('playlist','url','url_transparent'):
+        return 'unknown_metadata'
+    if info.get('is_live') is True or info.get('live_status')=='is_live':return 'live'
+    if info.get('live_status')=='is_upcoming':return 'upcoming'
+    if info.get('live_status') in ('was_live','post_live'):return 'ended'
+    if info.get('is_live') is False or info.get('live_status')=='not_live':return 'not_live_metadata'
+    return 'unknown_metadata'
 
 
 def _json_assignment(text, variable):

@@ -23,7 +23,7 @@ MESSAGES={'botcheck':"Sign in to confirm you're not a bot",'rate_limited':'Too m
           'age_verification':'Sign in to confirm your age','private_video':'Private video',
           'removed_video':'Video has been removed by the uploader','access_denied':'HTTP Error 403',
           'not_live':'The channel is not currently live','ended':'This live event has ended',
-          'network_error':'connection failed','extraction_failed':'download extraction failed'}
+          'network_error':'connection failed','no_formats':'No video formats found','extraction_failed':'download extraction failed'}
 
 
 def describe(reason):
@@ -57,6 +57,7 @@ def configure_session(session,metadata,cookies):
     session.set_option('stream-segment-threads',1)
     session.set_option('hls-playlist-reload-attempts',1)
     session.set_option('hls-live-edge',3)
+    session.set_option('hls-start-offset',60)
     session.set_option('hls-segment-stream-data',True)
     session.http.headers.update(metadata.get('http_headers') or {})
     if cookies and Path(cookies).is_file():

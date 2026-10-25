@@ -49,6 +49,8 @@ jobs:
         env:
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
           RCLONE_CONFIG_TEXT: ${{ secrets.RCLONE_CONFIG }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           CAPTURE_LIVE: ${{ inputs.capture_live }}
           VALIDATION_CHANNEL: ${{ inputs.channel }}
           VALIDATION_SECONDS: ${{ inputs.seconds }}
@@ -64,6 +66,7 @@ jobs:
             daily-validation.json
             setup-check.json
             drive-test-result.json
+            telegram-readiness.json
             upload-report.json
             streams/*_summary.json
             streams/rolling-backup.json
