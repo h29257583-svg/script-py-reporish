@@ -15,6 +15,13 @@ import sys
 import threading
 import time
 import unicodedata
+from probe_health import ProbeHealth, classify_message, live_badge_ids
+from media_chunks import chunk_order, unique_chunk_paths
+
+HEALTH = ProbeHealth()
+_HTML_CACHE = {}
+_HTML_CACHE_LOCK = threading.Lock()
+_LAST_ENDPOINT_PROBE = float("-inf")
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from queue import Empty, Queue
@@ -50,17 +57,17 @@ FORMAT_SELECTOR = (
 )
 SORT_EXPR = "res,fps,br"
 
-PRIMARY_RECHECK_SECONDS = 20
+PRIMARY_RECHECK_SECONDS = 30
 ACTIVE_SESSION_RECHECK_SECONDS = 120
-SECONDARY_WAITING_RECHECK_SECONDS = 90
+SECONDARY_WAITING_RECHECK_SECONDS = 180
 SECONDARY_ACTIVE_RECHECK_SECONDS = 120
 
-PROBE_TIMEOUT_SECONDS = 12
+PROBE_TIMEOUT_SECONDS = 20
 HTML_TIMEOUT_SECONDS = 6
 
 HEARTBEAT_SECONDS = 15
 POLL_INTERVAL_SECONDS = 2
-STALL_SECONDS = 240
+STALL_SECONDS = 90
 OFFLINE_GRACE_SECONDS = 180
 FAILURE_COOLDOWN_SECONDS = 15
 
@@ -75,8 +82,8 @@ STALL_RETRY_BACKOFF_SECONDS = 4
 CLIENT_SWITCH_DELAY_SECONDS = 5
 
 # Candidate order; use the probe workflow to validate clients on your runner.
-DOWNLOAD_CLIENTS = ["web_safari", None, "android"]
-VALIDATION_CLIENTS = ["android", "web_safari"]
+DOWNLOAD_CLIENTS = ["web_safari", None]
+VALIDATION_CLIENTS = ["web_safari", None]
 
 SESSION_ACTIVE = threading.Event()
 DOWNLOAD_ACTIVE = threading.Event()
@@ -198,6 +205,9 @@ def command_exists(name):
 
 
 def install_dependencies():
+    if os.environ.get('SKIP_DEPENDENCY_INSTALL')=='true':
+        log('dependencies_preinstalled | setup verification belongs to the launcher')
+        return
     log(f"installing dependencies for {CHANNEL_HANDLE} (cookies={USE_COOKIES})")
     try:
         subprocess.run(
@@ -244,15 +254,41 @@ def js_runtime_args():
 
 
 JS_ARGS = []
+FFMPEG_INPUT_ARGS = []
+
+
+def ffmpeg_reconnect_args():
+    # Detect options: hosted runners and users' PCs can have different FFmpeg versions.
+    try:
+        result = subprocess.run(["ffmpeg","-hide_banner","-h","protocol=http"], capture_output=True,text=True,timeout=10)
+        supported = result.stdout + result.stderr
+    except (OSError,subprocess.TimeoutExpired):
+        return []
+    options = [("reconnect","1"),("reconnect_streamed","1"),
+               ("reconnect_on_network_error","1"),("reconnect_on_http_error","408,5xx"),
+               ("reconnect_delay_max","5"),("reconnect_delay_total_max","45"),("rw_timeout","15000000")]
+    args = []
+    for name,value in options:
+        if name == "rw_timeout" or re.search(r"(?m)^\s*-"+re.escape(name)+r"\s",supported):
+            args += ["-"+name,value]
+    return ["--downloader-args","ffmpeg_i:"+" ".join(args)] if args else []
+
 
 
 def fetch_text(url):
+    if not HEALTH.permitted():
+        return ""
+    with _HTML_CACHE_LOCK:
+        cached = _HTML_CACHE.get(url)
+        if cached and time.monotonic()-cached[0] < 20:
+            return cached[1]
     curl_bin = shutil.which("curl")
     if not curl_bin:
+        HEALTH.observe("http_client_missing")
         return ""
 
     cmd = [
-        curl_bin, "-s", "-L", "--compressed", "--max-time", str(HTML_TIMEOUT_SECONDS),
+        curl_bin, "-s", "-L", "--fail-with-body", "--compressed", "--max-time", str(HTML_TIMEOUT_SECONDS),
         "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "-H", "Accept-Language: en-US,en;q=0.9",
     ]
@@ -262,9 +298,12 @@ def fetch_text(url):
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=HTML_TIMEOUT_SECONDS + 2)
         if result.returncode == 0 and result.stdout:
+            with _HTML_CACHE_LOCK:
+                _HTML_CACHE[url] = (time.monotonic(),result.stdout)
             return result.stdout
+        HEALTH.observe(classify_message(result.stderr))
     except Exception:
-        pass
+        HEALTH.observe("network_error")
     return ""
 
 
@@ -359,61 +398,39 @@ def is_live_candidate(info):
 
 
 def run_ytdlp_json(url, client):
-    command = [
-        sys.executable, "-m", "yt_dlp", "--no-config", "-J",
-        "--skip-download", "--no-warnings", "--ignore-no-formats-error",
-        "--playlist-items", "1",
-    ] + JS_ARGS
-
-    if client:
-        command += ["--extractor-args", f"youtube:player_client={client}"]
-    if USE_COOKIES and COOKIE_FILE and os.path.isfile(COOKIE_FILE):
-        command += ["--cookies", COOKIE_FILE]
-    command.append(url)
-
-    try:
-        result = subprocess.run(command, text=True, capture_output=True, timeout=PROBE_TIMEOUT_SECONDS)
-        if result.returncode == 0 and result.stdout.strip():
-            raw = json.loads(result.stdout)
-            if raw.get("_type") == "playlist" and raw.get("entries"):
-                for item in raw["entries"]:
-                    if item and is_live_candidate(item):
-                        return item
-                return raw["entries"][0]
-            return raw
-        if result.returncode:
-            message = normalize_message(result.stderr)
-            reason = "botcheck" if any(marker in message for marker in BOTCHECK_MARKERS) else (
-                "rate_limited" if any(marker in message for marker in RATE_LIMIT_MARKERS) else (
-                "not_live" if any(marker in message for marker in NOT_LIVE_MARKERS) else "extraction_failed"))
+    def extract():
+        command = [sys.executable, "-m", "yt_dlp", "--no-config", "-J",
+                   "--skip-download", "--no-warnings", "--ignore-no-formats-error",
+                   "--extractor-retries", "1", "--socket-timeout", "10",
+                   "--playlist-items", "1"] + JS_ARGS
+        if client:
+            command += ["--extractor-args", f"youtube:player_client={client}"]
+        if USE_COOKIES and COOKIE_FILE and os.path.isfile(COOKIE_FILE):
+            command += ["--cookies", COOKIE_FILE]
+        command.append(url)
+        try:
+            result = subprocess.run(command, text=True, capture_output=True, timeout=PROBE_TIMEOUT_SECONDS)
+            if result.returncode == 0 and result.stdout.strip():
+                raw = json.loads(result.stdout)
+                if raw.get("_type") == "playlist" and raw.get("entries"):
+                    raw = next((item for item in raw["entries"] if item and is_live_candidate(item)), raw["entries"][0])
+                reason = "live" if is_live_candidate(raw) else (
+                    "upcoming" if raw.get("live_status") == "is_upcoming" else "not_live_metadata")
+                return raw, reason
+            reason = classify_message(result.stderr)
             log(f"probe_failed | client={client_label(client)} | reason={reason} | exit={result.returncode}")
-    except subprocess.TimeoutExpired:
-        log(f"probe_failed | client={client_label(client)} | reason=timeout")
-    except Exception as exc:
-        log(f"probe_failed | client={client_label(client)} | reason={type(exc).__name__}")
-    return None
+            return None, reason
+        except subprocess.TimeoutExpired:
+            log(f"probe_failed | client={client_label(client)} | reason=network_error")
+            return None, "network_error"
+        except (OSError,ValueError,TypeError) as exc:
+            log(f"probe_failed | client={client_label(client)} | reason={type(exc).__name__}")
+            return None, "extraction_failed"
+    return HEALTH.call((url, client), extract)
 
 
 def extract_live_badge_ids(html):
-    if not html:
-        return []
-    scores = {}
-    patterns = [r'"videoId"\s*:\s*"([A-Za-z0-9_-]{11})"', r'watch\?v=([A-Za-z0-9_-]{11})', r'shorts/([A-Za-z0-9_-]{11})']
-    for pattern in patterns:
-        for match in re.finditer(pattern, html, flags=re.IGNORECASE):
-            video_id = match.group(1)
-            context = html[max(0, match.start() - 1500):min(len(html), match.end() + 1500)].lower()
-            score = scores.get(video_id, 0)
-            if any(k in context for k in ("islivenow", "is_live_now", "badge_style_type_live_now", '"style":"live"')):
-                score += 10
-            if re.search(r'"label"\s*:\s*"live"', context) or re.search(r'"text"\s*:\s*"live"', context):
-                score += 5
-            if "watching" in context:
-                score += 2
-            scores[video_id] = score
-
-    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-    return [video_id for video_id, score in ranked if score >= 5]
+    return live_badge_ids(html)
 
 
 def extract_rss_video_ids(xml):
@@ -429,6 +446,8 @@ def validate_candidate(video_id, client):
         return None
     matched, reason = target_match(info)
     if not matched:
+        HEALTH.observe('target_mismatch')
+        log(f"candidate_rejected | reason={reason} | candidate_channel={info.get('channel_id')}")
         return None
     return {"id": video_id, "url": watch_url, "client": client, "match_reason": reason}
 
@@ -437,112 +456,42 @@ def verify_live_id(video_id, source_kind):
     video_id = str(video_id or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
         return None
-
-    started = time.monotonic()
-    executor = ThreadPoolExecutor(max_workers=len(VALIDATION_CLIENTS))
-    futures = {executor.submit(validate_candidate, video_id, client): client for client in VALIDATION_CLIENTS}
-    result = None
-
-    try:
-        for future in as_completed(futures, timeout=PROBE_TIMEOUT_SECONDS + 2):
-            try:
-                candidate = future.result()
-            except Exception:
-                candidate = None
-            if candidate:
-                result = candidate
-                break
-    except Exception:
-        pass
-    finally:
-        executor.shutdown(wait=False)
-
-    if result:
-        elapsed = time.monotonic() - started
-        log(f"detect_live | source={source_kind} | live id={result['id']} | client={client_label(result['client'])} | match={result['match_reason']} | validation={elapsed:.1f}s")
-        return {"id": result["id"], "url": result["url"], "source": source_kind, "detected_client": result["client"]}
+    for client in VALIDATION_CLIENTS:
+        candidate = validate_candidate(video_id, client)
+        if candidate:
+            log(f"detect_live | source={source_kind} | live id={video_id} | client={client_label(client)} | match={candidate['match_reason']}")
+            return {"id":video_id,"url":candidate["url"],"source":source_kind,"detected_client":client}
+        if not HEALTH.permitted() or HEALTH.snapshot()['last_reason'] in ('upcoming','ended','private_video','removed_video','age_verification','not_live_metadata'):
+            break
     return None
 
 
 def probe_fast():
-    executor = ThreadPoolExecutor(max_workers=3)
-    futures = {
-        executor.submit(fetch_text, CHANNEL_URL): "home",
-        executor.submit(run_ytdlp_json, LIVE_URL, "android"): "android_live",
-        executor.submit(run_ytdlp_json, LIVE_URL, "web_safari"): "web_live",
-    }
-    home_html = ""
-    live_infos = {}
-
-    try:
-        for future in as_completed(futures, timeout=PROBE_TIMEOUT_SECONDS + 4):
-            kind = futures[future]
-            try:
-                value = future.result()
-            except Exception:
-                value = None
-            if kind == "home":
-                home_html = value or ""
-            else:
-                live_infos[kind] = value
-    except Exception:
-        pass
-    finally:
-        executor.shutdown(wait=False)
-
-    for key, client in (("android_live", "android"), ("web_live", "web_safari")):
-        info = live_infos.get(key)
-        if not info or not is_live_candidate(info):
-            continue
-        matched, reason = target_match(info)
-        if not matched:
-            continue
-        video_id = info["id"]
-        log(f"detect_live | source=live_endpoint | live id={video_id} | client={client} | match={reason}")
-        return {"id": video_id, "url": f"https://www.youtube.com/watch?v={video_id}", "source": "live_endpoint", "detected_client": client}
-
-    for video_id in extract_live_badge_ids(home_html)[:2]:
-        result = verify_live_id(video_id, "home_live_badge")
+    global _LAST_ENDPOINT_PROBE
+    html = fetch_text(LIVE_URL)
+    for video_id in extract_live_badge_ids(html)[:2]:
+        result = verify_live_id(video_id, "live_page_badge")
         if result:
             return result
+    # A full player extraction is a fallback, not two parallel requests every 20 seconds.
+    if time.monotonic() - _LAST_ENDPOINT_PROBE < 90:
+        return None
+    _LAST_ENDPOINT_PROBE = time.monotonic()
+    info = run_ytdlp_json(LIVE_URL, "web_safari")
+    if info and is_live_candidate(info):
+        matched, reason = target_match(info)
+        if matched:
+            video_id = info["id"]
+            log(f"detect_live | source=live_endpoint | live id={video_id} | client=web_safari | match={reason}")
+            return {"id":video_id,"url":f"https://www.youtube.com/watch?v={video_id}","source":"live_endpoint","detected_client":"web_safari"}
     return None
 
 
 def probe_secondary():
-    channel_id = TARGET.get("channel_id")
-    if not channel_id:
-        return None
-
-    rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
-    executor = ThreadPoolExecutor(max_workers=3)
-    futures = {
-        executor.submit(fetch_text, rss_url): "rss",
-        executor.submit(fetch_text, STREAMS_URL): "streams",
-        executor.submit(fetch_text, SHORTS_URL): "shorts",
-    }
-    values = {"rss": "", "streams": "", "shorts": ""}
-
-    try:
-        for future in as_completed(futures, timeout=HTML_TIMEOUT_SECONDS + 4):
-            kind = futures[future]
-            try:
-                value = future.result()
-            except Exception:
-                value = None
-            values[kind] = value or ""
-    except Exception:
-        pass
-    finally:
-        executor.shutdown(wait=False)
-
-    for video_id in extract_rss_video_ids(values["rss"]):
-        result = verify_live_id(video_id, "rss_feed")
-        if result:
-            return result
-
-    for page_name in ("streams", "shorts"):
-        for video_id in extract_live_badge_ids(values[page_name])[:2]:
-            result = verify_live_id(video_id, f"{page_name}_badge")
+    # RSS has no reliable live flag. Re-validating its latest VODs multiplies requests.
+    for name, url in (("streams",STREAMS_URL),("shorts",SHORTS_URL)):
+        for video_id in extract_live_badge_ids(fetch_text(url))[:2]:
+            result = verify_live_id(video_id, f"{name}_badge")
             if result:
                 return result
     return None
@@ -621,7 +570,7 @@ def save_active_state(active):
 
 
 def chunk_number(path):
-    match = re.search(r"_chunk(\d+)\.ts(?:\.part)?$", os.path.basename(path))
+    match = re.search(r"_chunk(\d+)(?:_short_exit_\d+)?\.ts(?:\.part)?$", os.path.basename(path))
     return int(match.group(1)) if match else 0
 
 
@@ -633,15 +582,13 @@ def register_recovered_chunks(active):
     os.makedirs(active["chunk_dir"], exist_ok=True)
     registered = [
         path for path in active.get("chunks", [])
-        if os.path.isfile(path) and os.path.getsize(path) >= MIN_SAVE_BYTES and not is_archived_short_exit(path)
+        if os.path.isfile(path) and os.path.getsize(path) >= MIN_SAVE_BYTES
     ]
     known = set(registered)
     recovered = []
 
     candidates = glob.glob(os.path.join(active["chunk_dir"], "*.ts")) + glob.glob(os.path.join(active["chunk_dir"], "*.ts.part"))
     for path in sorted(candidates, key=chunk_number):
-        if is_archived_short_exit(path):
-            continue
         final_path = path[:-5] if path.endswith(".part") else path
         if path.endswith(".part") and not os.path.exists(final_path) and os.path.getsize(path) >= MIN_SAVE_BYTES:
             try:
@@ -656,7 +603,7 @@ def register_recovered_chunks(active):
             known.add(path)
             recovered.append(path)
 
-    registered.sort(key=chunk_number)
+    registered.sort(key=chunk_order)
     active["chunks"] = registered
     highest = max([chunk_number(path) for path in registered] + [0])
     active["chunk_index"] = max(int(active.get("chunk_index", 1)), highest + 1)
@@ -743,9 +690,9 @@ def build_final_file(active):
     register_recovered_chunks(active)
     chunks = [
         path for path in active["chunks"]
-        if os.path.isfile(path) and os.path.getsize(path) >= MIN_SAVE_BYTES and not is_archived_short_exit(path)
+        if os.path.isfile(path) and os.path.getsize(path) >= MIN_SAVE_BYTES
     ]
-    chunks.sort(key=chunk_number)
+    chunks, duplicate_chunks = unique_chunk_paths(chunks)
     if not chunks:
         return None
 
@@ -758,7 +705,12 @@ def build_final_file(active):
                 shutil.copyfile(chunks[0], final_path)
             except Exception:
                 return None
-        return final_path if os.path.isfile(final_path) and os.path.getsize(final_path) >= MIN_SAVE_BYTES else None
+        if os.path.isfile(final_path) and os.path.getsize(final_path) >= MIN_SAVE_BYTES:
+            for duplicate in duplicate_chunks:
+                try:os.remove(duplicate)
+                except OSError:pass
+            return final_path
+        return None
 
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -782,7 +734,7 @@ def build_final_file(active):
             text=True, capture_output=True, timeout=180,
         )
         if result.returncode == 0 and os.path.isfile(final_path) and os.path.getsize(final_path) >= MIN_SAVE_BYTES:
-            for path in chunks:
+            for path in chunks + duplicate_chunks:
                 try: os.remove(path)
                 except Exception: pass
             try: os.remove(list_path)
@@ -848,21 +800,10 @@ def classify_output(output_state):
 
 
 def make_download_cmd(active, chunk_path, client):
-    command = [
-        sys.executable, "-m", "yt_dlp", "--no-config", "--newline", "--no-warnings",
-        "--restrict-filenames", "--no-part", "--no-playlist", "--no-live-from-start",
-        "--print", "before_dl:chosen=%(format_id)s | %(resolution)s | tbr=%(tbr)s | protocol=%(protocol)s",
-        "--retries", "20", "--extractor-retries", "20", "--file-access-retries", "20",
-        "--fragment-retries", "infinite", "--retry-sleep", "http:2", "--retry-sleep", "fragment:1",
-        "--skip-unavailable-fragments", "--hls-use-mpegts", "--downloader", "m3u8:native", "-N", "1",
-        "-f", FORMAT_SELECTOR, "-S", SORT_EXPR, "-o", chunk_path,
-    ] + JS_ARGS
-
-    if client:
-        command += ["--extractor-args", f"youtube:player_client={client}"]
+    command=[sys.executable,"hls_capture.py","--url",active["live_url"],"--output",chunk_path,
+             "--format",FORMAT_SELECTOR,"--client",client_label(client)]
     if USE_COOKIES and COOKIE_FILE and os.path.isfile(COOKIE_FILE):
-        command += ["--cookies", COOKIE_FILE]
-    command.append(active["live_url"])
+        command += ["--cookies",COOKIE_FILE]
     return command
 
 
@@ -1182,10 +1123,11 @@ def wait_for_start_time():
 log(f"process_boot | channel={CHANNEL_HANDLE} | utc={datetime.utcnow().isoformat(timespec='seconds')}Z")
 install_dependencies()
 JS_ARGS = js_runtime_args()
+FFMPEG_INPUT_ARGS = ffmpeg_reconnect_args()
 resolve_target_identity()
 wait_for_start_time()
 
-session_end = time.time() + HOURS * 3600
+session_end = min(time.time() + HOURS * 3600, float(os.environ.get("SESSION_DEADLINE", "inf")))
 active = load_active_state()
 
 live_queue = Queue()
@@ -1272,9 +1214,11 @@ finally:
 if active:
     close_session(active, "session complete")
 
+write_summary(probe_health=HEALTH.snapshot(), monitoring_finished_utc=datetime.utcnow().isoformat(timespec="seconds")+"Z")
 log("session_complete")
 if DISK_LIMIT_REACHED:
     raise SystemExit(3)
 if not any(os.path.getsize(path) >= MIN_SAVE_BYTES for path in glob.glob(os.path.join(OUT_DIR, "**", "*.ts"), recursive=True)):
-    log("no_recording_saved | monitoring finished without a final recording; this is not capture success")
+    write_summary(status="monitoring_finished_no_media", failure_reason="no_media", probe_health=HEALTH.snapshot())
+    log("no_recording_saved | monitoring finished without a final recording; inspect probe_health for offline/access/network evidence")
     raise SystemExit(2)

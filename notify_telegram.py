@@ -27,9 +27,14 @@ def main():
         lines.append('All uploads confirmed: ' + str(report.get('all_uploaded', False)))
         if not report.get('files'):
             lines.append('No recording files found.')
-        for entry in report.get('files', []):
-            lines.append(f'{entry["file"]}: {"uploaded" if entry["uploaded"] else "FAILED"}')
-            lines += [r['url'] for r in entry.get('receipts', [])]
+        lines.append('Unique uploaded files: '+str(report.get('unique_uploaded_files',sum(bool(f.get('uploaded')) for f in report.get('files',[])))))
+        if report.get('session_url'):
+            lines.append('Recordings for this session: '+report['session_url'])
+        elif report.get('files'):
+            lines.append('Upload receipts are in the workflow summary below.')
+        safety=report.get('safety_backup') or {}
+        if safety.get('uploaded_clips'):
+            lines.append('Safety clips uploaded: '+str(safety['uploaded_clips']))
     except (OSError, ValueError):
         lines.append('Upload report unavailable; inspect workflow logs.')
     if os.environ.get('GITHUB_SERVER_URL') and os.environ.get('GITHUB_REPOSITORY'):

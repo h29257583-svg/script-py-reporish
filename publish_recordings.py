@@ -63,9 +63,10 @@ def media_ok(path, timeout=15):
 
 def select_media(root):
     # Include recovered nested chunks and short captures; never discard by size/name alone.
-    return sorted(p for p in root.rglob('*') if p.is_file() and not p.is_symlink()
+    return sorted((p for p in root.rglob('*') if p.is_file() and not p.is_symlink()
                   and p.suffix.lower() in {'.ts', '.part', '.mp4', '.mkv'}
-                  and '.upload-work-' not in str(p) and p.stat().st_size > 0)
+                  and '.upload-work-' not in str(p) and p.stat().st_size > 0),
+                  key=lambda p:(len(p.relative_to(root).parts),str(p)))
 
 
 def split_for_release(source, destination, limit=RELEASE_LIMIT, timeout=300):
@@ -121,6 +122,14 @@ class Publisher:
         self.drive_config = os.environ.get('RCLONE_CONFIG', '')
         self.drive_prefix = os.environ.get('GDRIVE_REMOTE', 'drive:YouTubeRecordings')
         self.results = []
+        self.session_url = None
+        try:self.rolling=json.loads((self.root/'rolling-backup.json').read_text())
+        except (OSError,ValueError):self.rolling={}
+        self.category = 'recordings'
+        try:
+            self.prior = json.loads(self.report.read_text()).get('files',[])
+        except (OSError,ValueError,TypeError):
+            self.prior = []
 
     def remaining(self):
         value = self.end - time.monotonic()
@@ -131,7 +140,10 @@ class Publisher:
     def save(self):
         self.report.parent.mkdir(parents=True, exist_ok=True)
         value = {'files': self.results, 'all_uploaded': bool(self.results) and
-                 all(r.get('uploaded') for r in self.results)}
+                 all(r.get('uploaded') for r in self.results), 'session_url':self.session_url,
+                 'media_status':'media_present' if self.results else 'no_media',
+                 'unique_uploaded_files':sum(bool(r.get('uploaded')) and not r.get('duplicate_of') for r in self.results),
+                 'safety_backup':{k:self.rolling.get(k) for k in ('state','uploaded_clips','pending_clips','last_error')}}
         temporary = self.report.with_suffix('.tmp')
         temporary.write_text(json.dumps(value, indent=2))
         os.replace(temporary, self.report)
@@ -182,7 +194,13 @@ class Publisher:
         owner_repo = os.environ.get('GITHUB_REPOSITORY', 'local').replace('/', '_')
         run = os.environ.get('GITHUB_RUN_ID', 'local')
         name = re.sub(r'[^A-Za-z0-9_.-]+', '_', source.name)
-        remote = self.drive_prefix.rstrip('/') + '/' + owner_repo + '/' + run + '/' + metadata['sha256'][:20] + '-' + name
+        session = os.environ.get('RECORDING_SESSION_ID',run)
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,100}',session):
+            raise PublishError('invalid_recording_session_id')
+        window = os.environ.get('RECORDING_SHIFT_INDEX','0')
+        if not window.isdigit():raise PublishError('invalid_recording_shift_index')
+        session_path = self.drive_prefix.rstrip('/')+'/'+owner_repo+'/'+session
+        remote = session_path+'/shift-'+window+'/'+self.category+'/'+metadata['sha256'][:20]+'-'+name
         base = ['rclone', '--config', self.drive_config]
         copied = subprocess.run(base + ['copyto', str(source), remote, '--checksum',
                                         '--retries', '2', '--low-level-retries', '3',
@@ -202,7 +220,7 @@ class Publisher:
         file_id = details.get('ID', '')
         link = 'https://drive.google.com/file/d/' + file_id + '/view' if re.fullmatch(r'[A-Za-z0-9_-]+', file_id) else remote
         return {'provider': 'google_drive', 'url': link, 'remote_path': remote,
-                'verification': 'remote_size_and_md5', 'sharing': 'private; no sharing permissions changed'}
+                'session_path':session_path, 'verification': 'remote_size_and_md5', 'sharing': 'private; no sharing permissions changed'}
 
     def release(self, source, metadata, work):
         repo = os.environ.get('GITHUB_REPOSITORY', '')
@@ -210,6 +228,11 @@ class Publisher:
         if not re.fullmatch(r'[\w.-]+/[\w.-]+', repo) or not run.isdigit():
             raise PublishError('release_environment_missing')
         tag = 'recorder-backup-' + run
+        scope = os.environ.get('RELEASE_SCOPE', '')
+        if scope:
+            if not re.fullmatch(r'[A-Za-z0-9_-]{1,50}', scope):
+                raise PublishError('invalid_release_scope')
+            tag += '-' + scope
         def gh(*args):
             result = subprocess.run(['gh', *args], capture_output=True, text=True,
                                     timeout=min(300, self.remaining()))
@@ -246,9 +269,48 @@ class Publisher:
             self.save()
         return uploaded
 
+    def verified_prior(self, metadata):
+        # A cached success is reused only after checking the remote Drive object again.
+        for prior in self.prior:
+            if not isinstance(prior,dict) or not prior.get('uploaded') or prior.get('sha256')!=metadata['sha256']:
+                continue
+            for receipt in prior.get('receipts',[]):
+                if receipt.get('provider')!='google_drive' or not self.drive_config:
+                    continue
+                remote=receipt.get('remote_path','')
+                if not remote.startswith(self.drive_prefix.rstrip('/')+'/'):
+                    continue
+                try:
+                    info=subprocess.run(['rclone','--config',self.drive_config,'lsjson',remote,'--stat','--hash'],
+                                        capture_output=True,text=True,timeout=min(30,self.remaining()))
+                    data=json.loads(info.stdout)
+                    hashes={k.lower():str(v).lower() for k,v in data.get('Hashes',{}).items()}
+                    if info.returncode==0 and data.get('Size')==metadata['bytes'] and hashes.get('md5')==metadata['md5']:
+                        return prior
+                except (OSError,ValueError,subprocess.TimeoutExpired):
+                    pass
+        return None
+
+    def resolve_session_url(self):
+        if not self.drive_config:return
+        safety_receipts=[c.get('receipt',{}) for c in self.rolling.get('clips',[]) if c.get('status')=='uploaded']
+        for record in self.results + [{'receipts':safety_receipts}]:
+            for receipt in record.get('receipts',[]):
+                path=receipt.get('session_path')
+                if receipt.get('provider')!='google_drive' or not path:continue
+                try:
+                    result=subprocess.run(['rclone','--config',self.drive_config,'lsjson',path,'--stat'],
+                                          capture_output=True,text=True,timeout=min(20,self.remaining()))
+                    data=json.loads(result.stdout);folder=data.get('ID','')
+                    if result.returncode==0 and data.get('IsDir') and re.fullmatch(r'[A-Za-z0-9_-]+',folder):
+                        self.session_url='https://drive.google.com/drive/folders/'+folder
+                        return
+                except (OSError,ValueError,PublishError,subprocess.TimeoutExpired):pass
+
     def run(self):
         candidates = select_media(self.root)
         self.save()
+        seen = {}
         for path in candidates:
             record = {'file': str(path.relative_to(self.root)), 'uploaded': False, 'receipts': []}
             self.results.append(record)
@@ -260,6 +322,18 @@ class Publisher:
                 metadata = fingerprints(path, self.end)
                 self.remaining()
                 record.update(metadata)
+                previous=seen.get(metadata['sha256'])
+                if previous and previous.get('uploaded'):
+                    record.update(uploaded=True,receipts=previous['receipts'],duplicate_of=previous['file'])
+                    self.save()
+                    print('DEDUPLICATED '+record['file'],flush=True)
+                    continue
+                previous=self.verified_prior(metadata)
+                if previous:
+                    record.update(uploaded=True,receipts=previous['receipts'],resumed=True)
+                    seen[metadata['sha256']]=record
+                    self.save()
+                    continue
                 # Safe ASCII multipart filename; hard-link avoids another multi-GB copy.
                 with tempfile.TemporaryDirectory(prefix='.upload-work-', dir=path.parent) as directory:
                     work = Path(directory)
@@ -280,6 +354,7 @@ class Publisher:
                                 raise PublishError('gofile_failed_source_preserved') from None
                             receipts = self.release(path, metadata, work)
                     record.update(uploaded=True, receipts=receipts)
+                    seen[metadata["sha256"]]=record
                     self.save()
                 # Keep source on disk even after upload; lifecycle cleanup is explicit.
                 print('UPLOADED ' + record['file'], flush=True)
@@ -287,6 +362,8 @@ class Publisher:
                 record['error'] = str(error) if isinstance(error, PublishError) else type(error).__name__
                 print('UPLOAD_FAILED ' + record['file'] + ': ' + record['error'], flush=True)
             self.save()
+        self.resolve_session_url()
+        self.save()
         if not candidates:
             print('NO_RECORDING: no media files; this is not capture success', flush=True)
         return 0 if self.results and all(r['uploaded'] for r in self.results) else 1

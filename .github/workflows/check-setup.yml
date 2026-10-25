@@ -1,23 +1,72 @@
-name: Check recorder setup
+name: Bounded daily recorder validation
 on:
   workflow_dispatch:
+    inputs:
+      capture_live:
+        type: boolean
+        default: true
+      channel:
+        type: string
+        default: '@SkyNews'
+      seconds:
+        type: number
+        default: 90
+      run_unit_tests:
+        type: boolean
+        default: false
+      run_fault_test:
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
-  check:
+  validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-      - name: Check private cookie binding without contacting YouTube
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install pinned capture and test dependencies
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          missing=()
+          for binary in ffmpeg curl rclone; do
+            if ! command -v "$binary" >/dev/null; then missing+=("$binary"); fi
+          done
+          if ((${#missing[@]})); then
+            sudo apt-get -o Acquire::Retries=3 update -qq
+            sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 "${missing[@]}"
+          fi
+          python -m pip install -q -r requirements.txt -r requirements-dev.txt
+      - name: Check repo secrets, actual Drive and bounded live capture
+        timeout-minutes: 18
         env:
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
           RCLONE_CONFIG_TEXT: ${{ secrets.RCLONE_CONFIG }}
-        run: python3 check_setup.py
-      - name: Save small setup report
+          CAPTURE_LIVE: ${{ inputs.capture_live }}
+          VALIDATION_CHANNEL: ${{ inputs.channel }}
+          VALIDATION_SECONDS: ${{ inputs.seconds }}
+          RUN_UNIT_TESTS: ${{ inputs.run_unit_tests }}
+          RUN_FAULT_TEST: ${{ inputs.run_fault_test }}
+        run: python validate_daily.py
+      - name: Save metadata and verified upload receipts only
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: setup-check
-          path: setup-check.json
-          retention-days: 1
+          name: daily-validation-${{ github.run_id }}
+          path: |
+            daily-validation.json
+            setup-check.json
+            drive-test-result.json
+            upload-report.json
+            streams/*_summary.json
+            streams/rolling-backup.json
+            validation/network-blink-streamlink/result.json
+          if-no-files-found: warn
+          retention-days: 3

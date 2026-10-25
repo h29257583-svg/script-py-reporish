@@ -31,7 +31,10 @@ def main():
         print('Session deadline reached; no further shift started', flush=True)
         return
     body = json.dumps(dispatch_body()).encode()
-    url = f'https://api.github.com/repos/{repository}/actions/workflows/record.yml/dispatches'
+    workflow = os.environ.get('WORKFLOW_FILE', 'record.yml')
+    if not re.fullmatch(r'[A-Za-z0-9_.-]+\.ya?ml', workflow):
+        raise ValueError('Invalid workflow filename')
+    url = f'https://api.github.com/repos/{repository}/actions/workflows/{workflow}/dispatches'
     for attempt in range(3):
         request = urllib.request.Request(url, data=body, method='POST', headers={
             'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
