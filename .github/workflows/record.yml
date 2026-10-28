@@ -31,7 +31,7 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          - "@rishnaaa4u|UCsda8YnhZU-aabHGLZcCIfw"
+          - "@RestPointLofi|UCJuLInMZelIN2tp9QcMv0dg"
 
     steps:
       - name: Checkout Repository
