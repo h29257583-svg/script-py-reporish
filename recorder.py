@@ -195,9 +195,13 @@ def normalize_message(value):
     )
 
 
-BOTCHECK_MARKERS = ["sign in to confirm you're not a bot", "confirm you're not a bot"]
+BOTCHECK_MARKERS = ["sign in to confirm you're not a bot", "confirm you're not a bot", "g-recaptcha"]
 NO_FORMAT_MARKERS = ["no video formats found", "requested format is not available"]
-RATE_LIMIT_MARKERS = ["http error 403", "http error 429", "try again later", "too many requests"]
+RATE_LIMIT_MARKERS = [
+    "http error 403", "http error 429", "try again later",
+    "too many requests", "rate-limited by youtube", "rate-limited",
+    "the current session has been rate-limited"
+]
 NOT_LIVE_MARKERS = ["the channel is not currently live", "this live event will begin", "this live event has ended", "does not pass filter"]
 NORMAL_END_MARKERS = ["finished downloading", "download complete", "has already been downloaded"]
 
@@ -217,6 +221,7 @@ SUMMARY = {
     "still_live_at_end": False,
     "continuation_dispatched": False,
     "blocked_by_youtube": False,
+    "downloader_rate_limited": False,
     "probe_stats": PROBE_STATS,
     "failure_reason": None,
 }
@@ -1312,7 +1317,7 @@ def output_reader(stream, output_state):
 
 
 def classify_output(output_state):
-    for key in ("botcheck", "no_formats", "rate_limited", "not_live"):
+    for key in ("rate_limited", "botcheck", "no_formats", "not_live"):
         if output_state[key]:
             return key
     return "normal_end" if output_state["normal_exit"] else "no_file"
@@ -1544,6 +1549,8 @@ def run_download_attempt(active, session_end, client, live_queue):
     reason = classify_output(output_state)
     if stop_reason and reason == "no_file":
         reason = stop_reason
+    if reason in {"rate_limited", "botcheck"}:
+        write_summary(blocked_by_youtube=True, downloader_rate_limited=True, failure_reason=reason)
     log(f"download_failed | client={client_label(client)} | reason={reason} | duration={duration:.1f}s")
     return False, reason, replacement_live
 
@@ -1565,6 +1572,14 @@ def record_until_stop(active, session_end, live_queue):
             if time.time() >= session_end: return False, "session_end", None
             if reason in {"not_live", "normal_end"}: return False, reason, None
             last_reason = reason
+
+            if reason in {"rate_limited", "botcheck"}:
+                log(f"youtube_restriction_encountered | reason={reason} | stopping repeated client attempts per policy (no circumvention)")
+                active["last_failure_reason"] = reason
+                active["recovery_needed"] = False
+                save_active_state(active)
+                write_summary(blocked_by_youtube=True, downloader_rate_limited=True, failure_reason=reason)
+                return False, reason, None
 
             if reason == "short_exit":
                 short_attempts += 1
@@ -1706,19 +1721,26 @@ if __name__ == "__main__":
                     if reason in {"termination", "session_end"}:
                         break
 
+                    if reason in {"rate_limited", "botcheck"}:
+                        log(f"session_halted | YouTube returned explicit restriction ({reason}); closing session without circumvention")
+                        close_session(active, f"youtube_{reason}")
+                        write_summary(
+                            status="session_closed",
+                            blocked_by_youtube=True,
+                            downloader_rate_limited=True,
+                            close_reason=f"youtube_{reason}",
+                            failure_reason=reason
+                        )
+                        active = None
+                        continue
+
                     if reason in {
                         "not_live", "normal_end", "download_failed", "launch_error",
-                        "botcheck", "rate_limited", "no_formats", "no_file", "short_exit",
+                        "no_formats", "no_file", "short_exit",
                     }:
                         active["recovery_needed"] = True
                         active["last_failure_reason"] = reason
-                        if reason in {"botcheck", "rate_limited"}:
-                            streak = int(active.get("botcheck_streak", 0)) + 1
-                            active["botcheck_streak"] = streak
-                            wait_s = min(105, BOTCHECK_BASE_COOLDOWN_SECONDS + (streak - 1) * 30)
-                            write_summary(blocked_by_youtube=True, failure_reason=reason)
-                        else:
-                            wait_s = FAILURE_COOLDOWN_SECONDS
+                        wait_s = FAILURE_COOLDOWN_SECONDS
                         active["cooldown_until"] = time.time() + wait_s
                         live_state = check_live_state(active["live_id"])
                         if live_state == "LIVE":

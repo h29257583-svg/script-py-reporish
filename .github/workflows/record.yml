@@ -169,6 +169,7 @@ jobs:
           print("true" if (not dispatched and (live or always)) else "false")
           PY
           )
+          CHAINED_NOW="false"
           if [ "$NEED_DISPATCH" == "true" ] && [ "${SHIFTS_LEFT:-0}" -gt 0 ] 2>/dev/null; then
             NEXT_SHIFTS=$((SHIFTS_LEFT - 1))
             echo "Streamer $CHANNEL_HANDLE: dispatching continuation shift (always_continue=$ALWAYS_CONTINUE, shifts_left=$NEXT_SHIFTS)..."
@@ -177,7 +178,84 @@ jobs:
               -f shifts_left="${NEXT_SHIFTS}" \
               -f always_continue="${ALWAYS_CONTINUE}" \
               -f custom_target="${TARGET_DATA}" || true
+            CHAINED_NOW="true"
           fi
+
+          # Session status report for Step Summary
+          python3 - "$CHAINED_NOW" <<'PY'
+import glob, json, os, sys
+
+chained_now = (sys.argv[1] == "true") if len(sys.argv) > 1 else False
+
+d = {}
+for p in glob.glob("./streams/*_summary.json"):
+    try:
+        d = json.loads(open(p, encoding="utf-8").read())
+        break
+    except Exception:
+        pass
+
+ch = d.get("channel") or os.environ.get("CHANNEL_HANDLE", "Channel")
+stats = d.get("probe_stats") or {}
+blocked = d.get("blocked_by_youtube", False)
+dl_rate_limited = d.get("downloader_rate_limited", False)
+final_size = float(d.get("final_size_mb") or 0.0)
+chunk_count = int(d.get("chunk_count") or 0)
+c_off = int(stats.get("clean_offline", 0))
+c_blk = int(stats.get("blocked", 0))
+c_err = int(stats.get("error", 0))
+prewarm_dispatched = bool(d.get("continuation_dispatched"))
+shifts_left = int(os.environ.get("SHIFTS_LEFT", "0") or 0)
+
+media_files = []
+for ext in ("*.ts", "*.mp4", "*.part"):
+    for f in glob.glob(f"./streams/{ext}"):
+        if "_short_exit_" not in f:
+            try:
+                sz = os.path.getsize(f)
+                if sz >= 1_000_000:
+                    media_files.append((f, sz / 1048576))
+            except Exception:
+                pass
+
+step_lines = [f"### Session Report: `{ch}`"]
+
+# 1. Chaining: CHAIN_PASS
+if shifts_left > 0:
+    if prewarm_dispatched or chained_now:
+        step_lines.append(f"- 🔗 **CHAIN_PASS**: Continuation shift dispatched (shifts_left remaining: {max(0, shifts_left - 1)})")
+    else:
+        step_lines.append(f"- ⚠️ **CHAIN_WAITING**: Next shift queued (shifts_left remaining: {max(0, shifts_left - 1)})")
+else:
+    step_lines.append("- 🔗 **CHAIN_PASS**: Final shift in chain completed as planned (shifts_left: 0)")
+
+# 2. Recording & Detection: RECORD_PASS vs BLOCKED_NO_CAPTURE vs NO_LIVE_CONFIRMED vs UNVERIFIED
+if media_files and (final_size > 0 or chunk_count > 0):
+    fname, sz_mb = media_files[0]
+    step_lines.append(f"- 🎬 **RECORD_PASS**: Media captured successfully (`{os.path.basename(fname)}`, {sz_mb:.1f} MB, {chunk_count} chunks)")
+elif dl_rate_limited or blocked or c_blk > 0:
+    reason = d.get("failure_reason") or "explicit rate-limit / botcheck"
+    step_lines.append(f"- 🚫 **BLOCKED_NO_CAPTURE**: YouTube rate-limited or restricted download ({reason}; 0.0 MB saved). No circumvention attempted.")
+elif c_off > 0 and c_blk == 0 and c_err == 0:
+    step_lines.append(f"- 💤 **NO_LIVE_CONFIRMED**: Streamer confirmed offline throughout shift (clean probes: {c_off}).")
+elif c_off == 0 and c_blk == 0 and c_err == 0:
+    step_lines.append("- ❓ **UNVERIFIED**: Offline status unverified (clean_offline=0, blocked=0, error=0).")
+elif c_err > 0:
+    step_lines.append(f"- ⚠️ **UNVERIFIED_NETWORK_ERROR**: Probes encountered network/parse errors (clean_offline={c_off}, blocked={c_blk}, error={c_err}).")
+else:
+    step_lines.append(f"- ❓ **UNVERIFIED**: (clean_offline={c_off}, blocked={c_blk}, error={c_err})")
+
+summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
+if summary_file:
+    try:
+        with open(summary_file, "a", encoding="utf-8") as sf:
+            sf.write("\n".join(step_lines) + "\n\n")
+    except Exception:
+        pass
+
+for l in step_lines:
+    print(l)
+PY
 
           exit "${RECORDER_RC:-0}"
 
@@ -200,31 +278,7 @@ jobs:
           mapfile -t FILES < <(find ./streams -type f \( -name "*.ts" -o -name "*.part" -o -name "*.mp4" \) ! -name "*_short_exit_*" -size +1M | sort)
 
           if [ "${#FILES[@]}" -eq 0 ]; then
-            SUMMARY_DIAG=$(python3 - <<'PY'
-          import glob, json
-          for p in glob.glob("./streams/*_summary.json"):
-              try:
-                  d = json.loads(open(p, encoding="utf-8").read())
-                  stats = d.get("probe_stats") or {}
-                  blocked = d.get("blocked_by_youtube", False)
-                  c_off = stats.get("clean_offline", 0)
-                  c_blk = stats.get("blocked", 0)
-                  c_err = stats.get("error", 0)
-                  if blocked or c_blk > 0:
-                      print(f"Blocked/Rate-Limited by YouTube (clean_offline={c_off}, blocked={c_blk}, error={c_err})")
-                  elif c_off == 0 and c_err > 0:
-                      print(f"Probe Network/Parse Error — Unverified (clean_offline={c_off}, blocked={c_blk}, error={c_err})")
-                  else:
-                      print(f"Verified Offline (clean_offline={c_off}, blocked={c_blk}, error={c_err})")
-                  break
-              except Exception:
-                  pass
-          else:
-              print("Offline (No stream recorded)")
-          PY
-            )
-            echo "No stream recorded to upload: ${SUMMARY_DIAG}"
-            echo "### ${CHANNEL_HANDLE}: ${SUMMARY_DIAG}" >> "$GITHUB_STEP_SUMMARY"
+            echo "No stream recorded to upload (0 media files produced)."
             exit 0
           fi
 
@@ -375,12 +429,12 @@ jobs:
 
             # Write to GitHub Step Summary & send optional Telegram notification
             if [ -n "$UPLOAD_LINK" ]; then
-              echo "- ✅ **$FNAME** (${FSIZE_MB} MB) via **${UPLOAD_METHOD}**: $UPLOAD_LINK" >> "$GITHUB_STEP_SUMMARY"
+              echo "- 🚀 **UPLOAD_PASS**: Verified remote upload (${UPLOAD_METHOD}): $UPLOAD_LINK" >> "$GITHUB_STEP_SUMMARY"
               if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
-                MSG="✅ Stream Uploaded (${UPLOAD_METHOD})%0AChannel: ${CHANNEL_HANDLE}%0AFile: ${FNAME} (${FSIZE_MB} MB)%0ALink: ${UPLOAD_LINK}"
-                curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d "chat_id=${TELEGRAM_CHAT_ID}&text=${MSG}" >/dev/null || true
+                MSG="Stream Uploaded (${UPLOAD_METHOD})%0AChannel: ${CHANNEL_HANDLE}%0AFile: ${FNAME} (${FSIZE_MB} MB)%0ALink: ${UPLOAD_LINK}"
+                curl -s -S -o /dev/null -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d "chat_id=${TELEGRAM_CHAT_ID}&text=${MSG}" || true
               fi
             else
-              echo "- ❌ **$FNAME** (${FSIZE_MB} MB): Both Gofile and Google Drive uploads failed." >> "$GITHUB_STEP_SUMMARY"
+              echo "- ❌ **UPLOAD_FAIL**: Both Gofile and Google Drive uploads failed for $FNAME" >> "$GITHUB_STEP_SUMMARY"
             fi
           done
